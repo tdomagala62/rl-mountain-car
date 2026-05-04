@@ -9,7 +9,7 @@ class SAC_DATABASE:
     #observation state 1 min,max == [-1.2 0.6]
     #observation state 2 min,max == [-0.07 0.07]
     NOISE_STD:np.ndarray = field(default_factory=lambda: np.array([0.15, 0.03]))
-    PROCESS_NOISE:np.ndarray = field(default_factory=lambda: np.array([1e-4, 1e-6]))
+    PROCESS_NOISE:np.ndarray = field(default_factory=lambda: np.array([1e-3, 1e-4]))
 
 
 class NoisyObservationWrapper(ObservationWrapper):
@@ -33,35 +33,48 @@ class RewardWrapper(gym.Wrapper):
 
 
 class KalmanFilter:
-    def __init__(self, obs_dim:int, obs_noise:np.ndarray, process_noise:float = 0.01):
+    # MountainCarContinuous dynamics:
+    #   position += velocity          (dt = 1 step)
+    #   velocity += action * power    (power = 0.0015)
+    # gravity term cos(3*pos) is nonlinear so it is absorbed into process noise Q.
+    _POWER = 0.0015
+
+    def __init__(self, obs_dim: int, obs_noise: np.ndarray, process_noise: np.ndarray):
         n = obs_dim
-        self.F = np.eye(n)          # state transition 
-        self.H = np.eye(n)          # observation model
-        self.Q = np.eye(n) * process_noise
-        print(type(obs_noise))
-        self.R = np.diag(obs_noise ** 2)
-        self.x = np.zeros(n)        # state estimate
-        self.P = np.eye(n)          # error covariance
+        # State transition
+        self.F = np.array([[1.0, 1.0],
+                           [0.0, 1.0]])
+        # Control-input matrix
+        self.B = np.array([[0.0],
+                           [self._POWER]])
+        self.H = np.eye(n)                      # observation model
+        self.Q = np.diag(process_noise)         # process noise covariance
+        self.R = np.diag(obs_noise ** 2)        # measurement noise covariance
+        self.x = np.zeros(n)                    # state estimate
+        self.P = np.eye(n)                      # error covariance
 
     def reset(self, initial_obs: np.ndarray) -> None:
         self.x = initial_obs.copy()
         self.P = np.eye(len(initial_obs))
 
-    def update(self, z: np.ndarray) -> np.ndarray:
+    def update(self, z: np.ndarray, u: np.ndarray) -> np.ndarray:
         # Predict
-        x_pred = self.F @ self.x
+        u = np.atleast_1d(u).reshape(-1, 1)
+        x_pred = self.F @ self.x + (self.B @ u).squeeze()
         P_pred = self.F @ self.P @ self.F.T + self.Q
         # Update
         S = self.H @ P_pred @ self.H.T + self.R
         K = P_pred @ self.H.T @ np.linalg.inv(S)
         self.x = x_pred + K @ (z - self.H @ x_pred)
-        self.P = (np.eye(len(self.x)) - K @ self.H) @ P_pred
+
+        I_KH = np.eye(len(self.x)) - K @ self.H
+        self.P = I_KH @ P_pred @ I_KH.T + K @ self.R @ K.T
         return self.x.copy()
 
 
 class KalmanFilterWrapper(gym.Wrapper):
     """Applies a Kalman filter to smooth noisy observations."""
-    def __init__(self, env: gym.Env, obs_noise, process_noise: float = 0.01):
+    def __init__(self, env: gym.Env, obs_noise: np.ndarray, process_noise: np.ndarray):
         super().__init__(env)
         obs_dim = env.observation_space.shape[0]
         self.kf = KalmanFilter(obs_dim, obs_noise, process_noise)
@@ -69,11 +82,11 @@ class KalmanFilterWrapper(gym.Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.kf.reset(obs)
-        return self.kf.update(obs), info
+        return self.kf.update(obs, u=np.zeros(1)), info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        return self.kf.update(obs), reward, terminated, truncated, info
+        return self.kf.update(obs, u=action), reward, terminated, truncated, info
 
 
 def make_env(case: int, SAC_Data_config='', render_mode:str="rgb_array") -> gym.Env:
