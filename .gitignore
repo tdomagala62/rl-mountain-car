@@ -1,3 +1,7 @@
 venv/
 videos/
 runs/
+SAC/models
+SAC/gifs
+SAC/logs
+SAC/__pycache__
