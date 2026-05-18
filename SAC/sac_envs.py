@@ -2,17 +2,8 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import ObservationWrapper
 from gymnasium.spaces import Box
-from dataclasses import dataclass, field
 from collections import deque
-
-
-@dataclass
-class SAC_DATABASE:
-    #observation state 1 min,max == [-1.2 0.6]
-    #observation state 2 min,max == [-0.07 0.07]
-    NOISE_STD:np.ndarray = field(default_factory=lambda: np.array([0.15, 0.03]))
-    PROCESS_NOISE:np.ndarray = field(default_factory=lambda: np.array([1e-3, 1e-5]))
-    FRAME_STACK_N:int = 4
+from sac_utils import load_config, SAC_Database
 
 
 class NoisyObservationWrapper(ObservationWrapper):
@@ -184,9 +175,9 @@ def make_env(case: int, SAC_Data_config: str = '', render_mode: str = "rgb_array
     env = gym.make("MountainCarContinuous-v0", render_mode=render_mode)
     env = RewardWrapper(env)
  
-    cfg = SAC_DATABASE()
+    cfg:SAC_Database = SAC_Database()
     if SAC_Data_config:
-        pass
+        cfg = load_config(path=SAC_Data_config, cfg_class=SAC_Database) # type: ignore
  
     noise_std     = cfg.NOISE_STD
     process_noise = cfg.PROCESS_NOISE

@@ -1,0 +1,5 @@
+{
+    "NOISE_STD": [0.10, 0.02],
+    "PROCESS_NOISE": [1e-3, 1e-5],
+    "FRAME_STACK_N": 4
+}

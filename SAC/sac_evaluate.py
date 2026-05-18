@@ -2,7 +2,6 @@ import argparse
 import numpy as np
 from stable_baselines3 import SAC
 from sac_envs import make_env
-import sac_envs as _envs
 import gymnasium as gym
 import random
 import torch
@@ -72,8 +71,8 @@ def evaluate(case: int, SAC_Data_config='',
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate SAC on MountainCarContinuous")
-    parser.add_argument("--case", type=int, choices=[1, 2, 3], required=True,
-                        help="1=clean  2=noisy  3=noisy+Kalman")
+    parser.add_argument("--case", type=int, choices=[1, 2, 3, 4, 5], required=True,
+                        help="1=clean  2=noisy  3=noisy+Kalman  4=noisy+FS  =noisy+EKF")
     parser.add_argument("--episodes", type=int, default=10,
                         help="Number of evaluation episodes (default: 10)")
     parser.add_argument("--render", action="store_true",

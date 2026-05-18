@@ -6,18 +6,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from pytorch_lightning.loggers import TensorBoardLogger
 from sac_envs import make_env
 import torch
-from dataclasses import dataclass
-
-
-@dataclass
-class SAC_TRAIN_ENV:
-    verbose:int = 0
-    learning_rate:float = 1e-3
-    buffer_size:int = 100_000
-    batch_size:int = 256
-    ent_coef:str = "auto"
-    gamma:float = 0.99
-    tau:float =  0.005
+from sac_utils import load_config, SAC_Train_Env
 
 
 class TrainingLogger(BaseCallback):
@@ -70,9 +59,9 @@ def train(case:int,
     print(f"Using {device}")
 
     #initialize variables
-    SAC_Tenvs = SAC_TRAIN_ENV()
+    SAC_Tenvs:SAC_Train_Env = SAC_Train_Env()
     if SAC_Train_config:
-        pass
+        SAC_Tenvs = load_config(path=SAC_Train_config, cfg_class=SAC_Train_Env) # type: ignore
     model = SAC(
         "MlpPolicy",
         env,
@@ -104,8 +93,8 @@ def train(case:int,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SAC on MountainCarContinuous")
-    parser.add_argument("--case", type=int, choices=[1, 2, 3], required=True,
-                        help="1=clean  2=noisy  3=noisy+Kalman")
+    parser.add_argument("--case", type=int, choices=[1, 2, 3, 4, 5], required=True,
+                        help="1=clean  2=noisy  3=noisy+Kalman  4=noisy+FS  =noisy+EKF")
     parser.add_argument("--timesteps", type=int, default=150_000,
                         help="Total environment steps (default: 150 000)")
     parser.add_argument("--data_cfg", type=str, default='',
