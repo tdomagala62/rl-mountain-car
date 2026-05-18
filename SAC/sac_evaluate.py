@@ -31,7 +31,7 @@ def evaluate(case: int, SAC_Data_config='',
     #load the trained model from the appropriate case
     try:
         if not direct_model_path:
-            model = SAC.load(f"SAC/models/sac_case_{case}", env=env)
+            model = SAC.load(f"SAC/models/mountain_car_case_{case}", env=env)
         else:
             model = SAC.load(direct_model_path, env=env)
     except Exception as e:
