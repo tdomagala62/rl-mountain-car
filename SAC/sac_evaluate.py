@@ -12,7 +12,10 @@ def evaluate(case: int, SAC_Data_config='',
              direct_model_path:str="",
              n_episodes: int = 10, 
              render: bool = False, 
-             seed:int = 133) -> None:
+             seed:int = 133,
+             obs_noise:np.ndarray= np.array([]),
+             add_noise_to_case_1:bool=False) -> None:
+    
     print(f"\n{'='*55}")
     print(f"  Evaluating SAC – Case {case}")
     print(f"  Episodes  : {n_episodes}")
@@ -26,7 +29,10 @@ def evaluate(case: int, SAC_Data_config='',
             torch.cuda.manual_seed_all(seed)
 
     #create environment based on the selected case
-    env = make_env(case, SAC_Data_config=SAC_Data_config)        
+    env = make_env(case, 
+                   SAC_Data_config=SAC_Data_config, 
+                   obs_noise=obs_noise, 
+                   add_noise_to_case_1=add_noise_to_case_1)        
     #load the trained model from the appropriate case
     try:
         if not direct_model_path:
@@ -69,16 +75,60 @@ def evaluate(case: int, SAC_Data_config='',
     env.close()
 
 
+def evaluate_noise_levels(case: int, 
+                          SAC_Data_config='', 
+                          direct_model_path:str="",
+                          n_episodes: int = 10, 
+                          seed:int = 133,
+                          noise_evaluation:np.ndarray= np.array([])) -> None:
+    
+    for x in range(0,noise_evaluation.shape[0]):
+        noise = noise_evaluation[x,:]
+        print(f"{'='*55}")
+        print(f"  Evaluating on noise level: {noise}")
+        print(f"{'='*55}")
+        evaluate(case=case,
+                 SAC_Data_config=SAC_Data_config,
+                 direct_model_path=direct_model_path,
+                 n_episodes=n_episodes,
+                 render=False,
+                 seed=seed,
+                 obs_noise=noise,
+                 add_noise_to_case_1=True)
+    
+    
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate SAC on MountainCarContinuous")
     parser.add_argument("--case", type=int, choices=[1, 2, 3, 4, 5], required=True,
                         help="1=clean  2=noisy  3=noisy+Kalman  4=noisy+FS  =noisy+EKF")
     parser.add_argument("--episodes", type=int, default=10,
                         help="Number of evaluation episodes (default: 10)")
+    parser.add_argument("--seed", type=int, default=133,
+                        help="Seed value")
     parser.add_argument("--render", action="store_true",
                         help="Render the environment visually and store as gifs")
+    parser.add_argument("--eval_noise_levels", action="store_true",
+                        help="Evaluate agent on diffrent noise level values")
     parser.add_argument("--model_path",  type=str, default='',
                         help="Path to the model file")
+    parser.add_argument("--data_cfg_path",  type=str, default='',
+                        help="Path to the model data cfg file")
     args = parser.parse_args()
 
-    evaluate(case=args.case, n_episodes=args.episodes, render=args.render, direct_model_path=args.model_path)
+    if not args.eval_noise_levels:
+        evaluate(case=args.case, n_episodes=args.episodes, render=args.render, direct_model_path=args.model_path)
+    else:
+        noise_evaluation = np.array([[0.00, 0.000],
+                                     [0.05, 0.010],
+                                     [0.10, 0.020],
+                                     [0.15, 0.030],  
+                                     [0.20, 0.040],
+                                     [0.30, 0.060],
+                                     [0.45, 0.090],])
+        evaluate_noise_levels(case=args.case,
+                              SAC_Data_config=args.data_cfg_path, 
+                              direct_model_path=args.model_path,
+                              n_episodes=args.episodes,
+                              seed=args.seed,
+                              noise_evaluation=noise_evaluation)

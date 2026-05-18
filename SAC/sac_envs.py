@@ -164,7 +164,11 @@ class FrameStackWrapper(ObservationWrapper):
         return np.concatenate(list(self._frames), axis=0), info
  
  
-def make_env(case: int, SAC_Data_config: str = '', render_mode: str = "rgb_array") -> gym.Env:
+def make_env(case: int,
+             SAC_Data_config: str = '',
+             render_mode: str = "rgb_array",
+             obs_noise: np.ndarray = np.array([]),
+             add_noise_to_case_1:bool = False) -> gym.Env:
     """
     Case 1: clean
     Case 2: noisy
@@ -182,16 +186,22 @@ def make_env(case: int, SAC_Data_config: str = '', render_mode: str = "rgb_array
     noise_std     = cfg.NOISE_STD
     process_noise = cfg.PROCESS_NOISE
     n_frames      = cfg.FRAME_STACK_N
+
+    if obs_noise.size == 0:
+        obs_noise = noise_std
  
     if case == 1:
-        return env
+        if not add_noise_to_case_1:
+            return env
+        else:
+            return NoisyObservationWrapper(env, obs_noise)
     elif case == 2:
-        return NoisyObservationWrapper(env, noise_std)
+        return NoisyObservationWrapper(env, obs_noise)
     elif case == 3:
-        return KalmanFilterWrapper(NoisyObservationWrapper(env, noise_std), noise_std, process_noise)
+        return KalmanFilterWrapper(NoisyObservationWrapper(env, obs_noise), noise_std, process_noise)
     elif case == 4:
-        return FrameStackWrapper(NoisyObservationWrapper(env, noise_std), n_frames=n_frames)
+        return FrameStackWrapper(NoisyObservationWrapper(env, obs_noise), n_frames=n_frames)
     elif case == 5:
-        return EKFWrapper(NoisyObservationWrapper(env, noise_std), noise_std, process_noise)
+        return EKFWrapper(NoisyObservationWrapper(env, obs_noise), noise_std, process_noise)
     else:
         raise ValueError(f"Unknown case: {case}. Choose 1–5.")
