@@ -9,11 +9,11 @@ class SAC_Database:
     #observation state 2 min,max == [-0.07 0.07]
     NOISE_STD:np.ndarray = field(default_factory=lambda: np.array([0.15, 0.03]))
     PROCESS_NOISE:np.ndarray = field(default_factory=lambda: np.array([1e-3, 1e-5]))
-    FRAME_STACK_N:int = 4
+    FRAME_STACK_N:int = 8
 
 
 @dataclass
-class SAC_TRAIN_ENV:
+class SAC_Train_Env:
     verbose:int = 0
     learning_rate:float = 1e-3
     buffer_size:int = 100_000
@@ -33,13 +33,3 @@ def load_config(path: str, cfg_class: type) -> object:
     with open(path, "r") as f:
         data = json.load(f)
     return dacite.from_dict(data_class=cfg_class, data=data, config=DACITE_CONFIG)
-
-
-def main():
-    data_path = "./SAC/sac_json/sac_data_1.json"
-    print(SAC_DATABASE())
-    modified = load_config(data_path, SAC_DATABASE)
-    print(modified)
-
-if __name__ == "__main__":
-    main()
