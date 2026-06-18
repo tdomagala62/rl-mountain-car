@@ -5,20 +5,15 @@ from torch.distributions import Normal
 import gymnasium as gym
 import matplotlib.pyplot as plt
 from pathlib import Path
-import time
-import json
+import random
 
-
-NOISE_TYPE = "gaussian"
-FILTER_TYPE = "KF"
-SCENARIO = 1
-RUN_MODE = "noise_sweep"
-
+FILTER_TYPE = "EKF"
+RUN_MODE = "filter_sweep"
 
 ENV_ID = "MountainCarContinuous-v0"
-SEED = 42
+BASE_SEED = 123
 TOTAL_STEPS = 100_000
-ROLLOUT_STEPS = 1024
+ROLLOUT_STEPS = 4096
 EPOCHS = 10
 MINIBATCH_SIZE = 128
 GAMMA = 0.99
@@ -30,11 +25,20 @@ VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NOISE_STD = 0.05
 PROCESS_NOISE = 1e-4
+EVAL_EPISODES = 20
+NOISE_CONFIGS = [
+    (0.00, 0.000),
+    (0.02, 0.002),
+    (0.04, 0.004),
+    (0.08, 0.008),
+]
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 class RunningMeanStd:
@@ -66,12 +70,12 @@ class RunningMeanStd:
         return np.clip((x - self.mean) / self.std, -10, 10)
 
     def state_dict(self):
-        return {"mean": self.mean, "var": self.var, "count": self.count}
+        return {"mean": self.mean.copy(), "var": self.var.copy(), "count": float(self.count)}
 
     def load_state_dict(self, d):
-        self.mean = d["mean"]
-        self.var = d["var"]
-        self.count = d["count"]
+        self.mean = np.array(d["mean"])
+        self.var = np.array(d["var"])
+        self.count = float(d["count"])
 
 
 class ActorCritic(nn.Module):
@@ -139,61 +143,45 @@ def ppo_update(model, optimizer, obs, actions, log_probs_old, returns, advantage
             optimizer.step()
 
 
-def add_noise(obs, noise_std, noise_type):
-    if noise_std == 0.0:
-        return obs.copy()
-    if noise_type == "gaussian":
-        return obs + np.random.normal(0, noise_std, obs.shape)
-    elif noise_type == "jednostajny":
-        half = noise_std * np.sqrt(3)
-        return obs + np.random.uniform(-half, half, obs.shape)
-    elif noise_type == "laplacea":
-        scale = noise_std / np.sqrt(2)
-        return obs + np.random.laplace(0, scale, obs.shape)
-    elif noise_type == "impulsowy":
-        noisy = obs.copy()
-        mask = np.random.rand(*obs.shape) < 0.05
-        noisy[mask] += np.random.choice([-10 * noise_std, 10 * noise_std], size=mask.sum())
-        return noisy
+def add_noise(obs, sigma_pos, sigma_vel):
+    noisy = obs.copy()
+    if sigma_pos > 0:
+        noisy[0] += np.random.normal(0, sigma_pos)
+    if sigma_vel > 0:
+        noisy[1] += np.random.normal(0, sigma_vel)
+    return noisy
 
 def mcc_dynamics(x, u):
     pos, vel = x
     vel_new = vel + 0.001 * u - 0.0025 * np.cos(3 * pos)
     vel_new = np.clip(vel_new, -0.07, 0.07)
-    pos_new = pos + vel_new
-    pos_new = np.clip(pos_new, -1.2, 0.6)
+    pos_new = np.clip(pos + vel_new, -1.2, 0.6)
     return np.array([pos_new, vel_new])
 
 
 def mcc_jacobian(x, u):
-    pos, vel = x
-    dvel_dpos = 0.0025 * 3 * np.sin(3 * pos)
-    F = np.array([
-        [1 + dvel_dpos, 1.0],
-        [dvel_dpos,     1.0]
-    ])
-    return F
+    pos = x[0]
+    dv_dp = 0.0025 * 3 * np.sin(3 * pos)
+    return np.array([[1 + dv_dp, 1.0], [dv_dp, 1.0]])
 
 class KalmanFilter:
-    def __init__(self, obs_dim, noise_std, process_noise):
-        self.obs_dim = obs_dim
+    def __init__(self, sigma_pos, sigma_vel):
         self.F = np.array([[1, 1], [0, 1]])
-        self.H = np.eye(2) if obs_dim == 2 else np.array([[1, 0]])
-        self.R = (np.eye(2) if obs_dim == 2 else np.array([[1]])) * noise_std**2
-        self.Q = np.eye(2) * process_noise
+        self.H = np.eye(2)
+        self.R = np.diag([sigma_pos**2 if sigma_pos > 0 else 1e-6,
+                          sigma_vel**2 if sigma_vel > 0 else 1e-6])
+        self.Q = np.eye(2) * PROCESS_NOISE
         self.x = None
         self.P = None
 
-    def reset(self, first_obs):
-        self.x = first_obs.copy() if self.obs_dim == 2 else np.array([first_obs[0], 0.0])
+    def reset(self, obs):
+        self.x = obs.copy()
         self.P = np.diag([1.0, 10.0])
 
-    def step(self, noisy_obs, action):
+    def step(self, noisy_obs, action=0.0):
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
-
-        z = noisy_obs if self.obs_dim == 2 else noisy_obs[:1]
-        y = z - self.H @ self.x
+        y = noisy_obs - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y
@@ -203,25 +191,23 @@ class KalmanFilter:
 
 
 class ExtendedKalmanFilter:
-    def __init__(self, obs_dim, noise_std, process_noise):
-        self.obs_dim = obs_dim
-        self.H = np.eye(2) if obs_dim == 2 else np.array([[1, 0]])
-        self.R = (np.eye(2) if obs_dim == 2 else np.array([[1]])) * noise_std**2
-        self.Q = np.eye(2) * process_noise
+    def __init__(self, sigma_pos, sigma_vel):
+        self.H = np.eye(2)
+        self.R = np.diag([sigma_pos**2 if sigma_pos > 0 else 1e-6,
+                          sigma_vel**2 if sigma_vel > 0 else 1e-6])
+        self.Q = np.eye(2) * PROCESS_NOISE
         self.x = None
         self.P = None
 
-    def reset(self, first_obs):
-        self.x = first_obs.copy() if self.obs_dim == 2 else np.array([first_obs[0], 0.0])
+    def reset(self, obs):
+        self.x = obs.copy()
         self.P = np.diag([1.0, 10.0])
 
-    def step(self, noisy_obs, action):
+    def step(self, noisy_obs, action=0.0):
         self.x = mcc_dynamics(self.x, action)
-        F = mcc_jacobian(self.x, action)
-        self.P = F @ self.P @ F.T + self.Q
-
-        z = noisy_obs if self.obs_dim == 2 else noisy_obs[:1]
-        y = z - self.H @ self.x
+        F_jac = mcc_jacobian(self.x, action)
+        self.P = F_jac @ self.P @ F_jac.T + self.Q
+        y = noisy_obs - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y
@@ -230,125 +216,63 @@ class ExtendedKalmanFilter:
         return self.x.copy()
 
 
-def make_filter(filter_type, obs_dim, noise_std, process_noise):
+def make_filter(filter_type, sigma_pos, sigma_vel):
     if filter_type == "KF":
-        return KalmanFilter(obs_dim, noise_std, process_noise)
+        return KalmanFilter(sigma_pos, sigma_vel)
     elif filter_type == "EKF":
-        return ExtendedKalmanFilter(obs_dim, noise_std, process_noise)
-    elif filter_type == "brak":
-        return None
+        return ExtendedKalmanFilter(sigma_pos, sigma_vel)
+    return None
 
 
-class Metrics:
-    def __init__(self, label):
-        self.label = label
-        self.episode_returns = []
-        self.episode_lengths = []
-        self.success_flags = []
-        self.wall_time = []
-        self.steps_at_episode = []
-        self.t_start = None
-
-    def start(self):
-        self.t_start = time.time()
-
-    def record(self, ret, length, step):
-        self.episode_returns.append(ret)
-        self.episode_lengths.append(length)
-        self.success_flags.append(float(ret > 90))
-        self.wall_time.append(time.time() - self.t_start)
-        self.steps_at_episode.append(step)
-
-    def summary(self):
-        r = np.array(self.episode_returns)
-        s = np.array(self.success_flags)
-        return {
-            "label": self.label,
-            "mean_return": float(np.mean(r)),
-            "std_return": float(np.std(r)),
-            "max_return": float(np.max(r)),
-            "mean_return_last50": float(np.mean(r[-50:])) if len(r) >= 50 else float(np.mean(r)),
-            "success_rate": float(np.mean(s)),
-            "success_rate_last50": float(np.mean(s[-50:])) if len(s) >= 50 else float(np.mean(s)),
-            "total_episodes": len(r),
-            "total_wall_time_s": float(self.wall_time[-1]) if self.wall_time else 0.0,
-            "steps_to_first_success": int(self.steps_at_episode[np.argmax(s > 0)]) if s.any() else -1,
-        }
-
-    def save(self, path):
-        data = {
-            "label": self.label,
-            "episode_returns": self.episode_returns,
-            "episode_lengths": self.episode_lengths,
-            "success_flags": self.success_flags,
-            "wall_time": self.wall_time,
-            "steps_at_episode": self.steps_at_episode,
-            "summary": self.summary()
-        }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-
-def train(scenario, noise_std, noise_type, filter_type, save_path, label=None):
-    obs_dim_sensor = 2 if scenario == 1 else 1
-    label = label or f"PPO | {filter_type} | {noise_type} σ={noise_std}"
-    metrics = Metrics(label)
-
-    print(f"\n{'='*60}")
-    print(f"  {label}")
-    print(f"  Scenariusz: {'pos+vel z szumem' if scenario==1 else 'tylko pos z szumem, vel estymowana'}")
-    print(f"{'='*60}")
-
+def train(label, sigma_pos=0.0, sigma_vel=0.0, filter_type="brak", save_path=None):
+    set_seed(BASE_SEED)
     env = gym.make(ENV_ID)
+    obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
-    agent_obs_dim = 2
 
-    model = ActorCritic(agent_obs_dim, act_dim).to(DEVICE)
+    model = ActorCritic(obs_dim, act_dim).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, eps=1e-5)
-
-    obs_rms = RunningMeanStd(shape=(agent_obs_dim,))
+    obs_rms = RunningMeanStd(shape=(obs_dim,))
     ret_rms = RunningMeanStd(shape=())
-    filt = make_filter(filter_type, obs_dim_sensor, noise_std, PROCESS_NOISE)
+    filt = make_filter(filter_type, sigma_pos, sigma_vel)
 
-    obs_buf = torch.zeros(ROLLOUT_STEPS, agent_obs_dim, device=DEVICE)
+    obs_buf = torch.zeros(ROLLOUT_STEPS, obs_dim, device=DEVICE)
     act_buf = torch.zeros(ROLLOUT_STEPS, act_dim, device=DEVICE)
     logp_buf = torch.zeros(ROLLOUT_STEPS, device=DEVICE)
     rew_buf = torch.zeros(ROLLOUT_STEPS, device=DEVICE)
     done_buf = torch.zeros(ROLLOUT_STEPS, device=DEVICE)
     val_buf = torch.zeros(ROLLOUT_STEPS, device=DEVICE)
 
+    ep_returns, ep_lengths, ep_steps, ep_success = [], [], [], []
     ep_ret, ep_len = 0.0, 0
+    ep_idx = 0
 
-    def get_filtered_obs(raw_obs, action=0.0):
-        noisy = add_noise(raw_obs, noise_std, noise_type)
-        if filt is None:
-            return noisy
-        return filt.step(noisy, action)
-
-    true_obs_np, _ = env.reset(seed=SEED)
-    noisy_init = add_noise(true_obs_np, noise_std, noise_type)
+    obs_np, _ = env.reset(seed=BASE_SEED + ep_idx)
+    noisy = add_noise(obs_np, sigma_pos, sigma_vel)
     if filt is not None:
-        filt.reset(noisy_init)
-    filtered_obs = get_filtered_obs(true_obs_np, 0.0)
-
-    obs_rms.update(filtered_obs[None])
-    obs = torch.tensor(obs_rms.normalize(filtered_obs), dtype=torch.float32, device=DEVICE)
+        filt.reset(noisy)
+        obs_in = filt.step(noisy)
+    else:
+        obs_in = noisy
+    obs_rms.update(obs_in[None])
+    obs = torch.tensor(obs_rms.normalize(obs_in), dtype=torch.float32, device=DEVICE)
 
     step = 0
-    metrics.start()
-
     while step < TOTAL_STEPS:
         raw_rewards = []
-
         for t in range(ROLLOUT_STEPS):
             action, logp, val = model.act(obs.unsqueeze(0))
             action = action.squeeze(0)
-            clipped_action = action.cpu().numpy().clip(env.action_space.low, env.action_space.high)
+            clipped = action.cpu().numpy().clip(env.action_space.low, env.action_space.high)
 
-            true_next_obs, raw_reward, terminated, truncated, _ = env.step(clipped_action)
+            next_obs_np, raw_reward, terminated, truncated, _ = env.step(clipped)
             done = terminated or truncated
 
-            filtered_next_obs = get_filtered_obs(true_next_obs, clipped_action.squeeze())
+            noisy_next = add_noise(next_obs_np, sigma_pos, sigma_vel)
+            if filt is not None:
+                obs_in_next = filt.step(noisy_next, float(clipped[0]))
+            else:
+                obs_in_next = noisy_next
 
             raw_rewards.append(raw_reward)
             ep_ret += raw_reward
@@ -361,20 +285,26 @@ def train(scenario, noise_std, noise_type, filter_type, save_path, label=None):
             done_buf[t] = float(done)
             val_buf[t] = val.squeeze()
 
-            obs_rms.update(filtered_next_obs[None])
-            obs = torch.tensor(obs_rms.normalize(filtered_next_obs), dtype=torch.float32, device=DEVICE)
+            obs_rms.update(obs_in_next[None])
+            obs = torch.tensor(obs_rms.normalize(obs_in_next), dtype=torch.float32, device=DEVICE)
 
             if done:
-                metrics.record(ep_ret, ep_len, step)
+                ep_returns.append(ep_ret)
+                ep_lengths.append(ep_len)
+                ep_steps.append(step + t)
+                ep_success.append(float(ep_ret > 90))
+                ep_idx += 1
                 ep_ret = ep_len = 0
 
-                true_obs_np, _ = env.reset()
-                noisy_init = add_noise(true_obs_np, noise_std, noise_type)
+                obs_np, _ = env.reset(seed=BASE_SEED + ep_idx)
+                noisy = add_noise(obs_np, sigma_pos, sigma_vel)
                 if filt is not None:
-                    filt.reset(noisy_init)
-                filtered_obs = get_filtered_obs(true_obs_np, 0.0)
-                obs_rms.update(filtered_obs[None])
-                obs = torch.tensor(obs_rms.normalize(filtered_obs), dtype=torch.float32, device=DEVICE)
+                    filt.reset(noisy)
+                    obs_in = filt.step(noisy)
+                else:
+                    obs_in = noisy
+                obs_rms.update(obs_in[None])
+                obs = torch.tensor(obs_rms.normalize(obs_in), dtype=torch.float32, device=DEVICE)
 
         disc_rets = []
         running_return = 0.0
@@ -382,7 +312,6 @@ def train(scenario, noise_std, noise_type, filter_type, save_path, label=None):
             running_return = r + GAMMA * running_return * (1 - d)
             disc_rets.append(running_return)
         ret_rms.update(np.array(disc_rets))
-
         rew_buf_norm = (rew_buf / ret_rms.std).clamp(-10, 10)
 
         with torch.no_grad():
@@ -391,148 +320,190 @@ def train(scenario, noise_std, noise_type, filter_type, save_path, label=None):
         ppo_update(model, optimizer, obs_buf, act_buf, logp_buf, returns, advantages)
 
         step += ROLLOUT_STEPS
-        if metrics.episode_returns:
-            mean_ret = np.mean(metrics.episode_returns[-10:])
-            sr = np.mean(metrics.success_flags[-10:]) * 100
-            print(f"step {step:>8} | eps {len(metrics.episode_returns):>4} | "
-                  f"ret(10) {mean_ret:>8.2f} | success(10) {sr:>5.1f}%")
+        if ep_returns:
+            n = len(ep_returns)
+            last = slice(max(0, n - 10), n)
+            print(f"[{label[:30]}] step {step:>8} | eps {n:>4} | "
+                  f"ret(10) {np.mean(ep_returns[last]):>8.2f} | "
+                  f"SR(10) {np.mean(ep_success[last])*100:>5.1f}%")
 
     env.close()
-    torch.save({"model": model.state_dict(), "obs_rms": obs_rms.state_dict()}, save_path)
-    metrics.save(str(save_path).replace(".pt", "_metrics.json"))
-    print(f"\nZapisano → {save_path}")
-    print_summary(metrics.summary())
-    return metrics
+
+    result = {
+        "label": label,
+        "ep_returns": np.array(ep_returns),
+        "ep_lengths": np.array(ep_lengths),
+        "ep_steps": np.array(ep_steps),
+        "ep_success": np.array(ep_success),
+        "sigma_pos": sigma_pos,
+        "sigma_vel": sigma_vel,
+        "filter_type": filter_type,
+        "model_state": model.state_dict(),
+        "obs_rms": obs_rms.state_dict(),
+    }
+    if save_path:
+        torch.save({k: v for k, v in result.items()
+                    if k not in ("ep_returns", "ep_lengths", "ep_steps", "ep_success")},
+                   save_path)
+    return result
 
 
-def print_summary(s):
-    print(f"\n  {'Metryka':<35} {'Wartość':>12}")
-    print(f"  {'-'*50}")
-    for k, v in s.items():
-        if k == "label":
-            continue
-        if isinstance(v, float):
-            print(f"  {k:<35} {v:>12.4f}")
+def evaluate(result):
+    sigma_pos = result["sigma_pos"]
+    sigma_vel = result["sigma_vel"]
+    filter_type = result["filter_type"]
+
+    env = gym.make(ENV_ID)
+    model = ActorCritic(env.observation_space.shape[0], env.action_space.shape[0]).to(DEVICE)
+    model.load_state_dict(result["model_state"])
+    model.eval()
+    obs_rms = RunningMeanStd(shape=(env.observation_space.shape[0],))
+    obs_rms.load_state_dict(result["obs_rms"])
+
+    returns, lengths = [], []
+    for ep in range(EVAL_EPISODES):
+        filt = make_filter(filter_type, sigma_pos, sigma_vel)
+        obs_np, _ = env.reset(seed=BASE_SEED + 10_000 + ep)
+        noisy = add_noise(obs_np, sigma_pos, sigma_vel)
+        if filt is not None:
+            filt.reset(noisy)
+            obs_in = filt.step(noisy)
         else:
-            print(f"  {k:<35} {v:>12}")
+            obs_in = noisy
+
+        done, total, length = False, 0.0, 0
+        while not done:
+            obs_t = torch.tensor(obs_rms.normalize(obs_in), dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            with torch.no_grad():
+                dist, _ = model.get_dist(obs_t)
+                action = dist.mean.squeeze(0).cpu().numpy()
+            next_obs_np, reward, terminated, truncated, _ = env.step(
+                action.clip(env.action_space.low, env.action_space.high))
+            done = terminated or truncated
+            total += reward
+            length += 1
+            noisy_next = add_noise(next_obs_np, sigma_pos, sigma_vel)
+            obs_in = filt.step(noisy_next, float(action[0])) if filt is not None else noisy_next
+
+        returns.append(total)
+        lengths.append(length)
+
+    env.close()
+    return np.array(returns), np.array(lengths)
 
 
-def plot_metrics_comparison(metrics_list, title, save_path):
-    plt.figure(figsize=(10, 6))
-    plt.title(title, fontsize=13)
+def metrics(result):
+    r = result["ep_returns"]
+    s = result["ep_success"]
+    st = result["ep_steps"]
+    n = len(r)
+    last50 = slice(max(0, n - 50), n)
+    first = int(st[np.argmax(s > 0)]) if s.any() else -1
+    return {
+        "Ret(50)": float(np.mean(r[last50])),
+        "SR(50)": float(np.mean(s[last50]) * 100),
+        "MaxRet": float(np.max(r)) if n > 0 else 0.0,
+        "1st sukces": first,
+    }
 
-    colors = plt.cm.tab10(np.linspace(0, 1, len(metrics_list)))
 
-    for m, c in zip(metrics_list, colors):
-        returns = np.array(m.episode_returns)
-        steps = np.array(m.steps_at_episode)
+def plot_training(result, save_path="plot_training.png"):
+    r = result["ep_returns"]
+    l = result["ep_lengths"]
+    st = result["ep_steps"]
 
-        if len(returns) > 0:
-            plt.plot(
-                range(len(returns)),
-                returns,
-                color=c,
-                lw=1.5,
-                label=m.label
-            )
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig.suptitle(f"Trening PPO - wersja bazowa", fontsize=13)
 
-    
+    axes[0].plot(st, r, color="steelblue", lw=0.8, alpha=0.8)
+    axes[0].set_ylabel("Return")
+    axes[0].set_title("Wykres nagrody")
+    axes[0].legend(fontsize=9)
+    axes[0].grid(alpha=0.3)
 
-    plt.xlabel("Kroki środowiska")
-    plt.ylabel("Return")
-    plt.grid(alpha=0.3)
-    plt.legend()
+    axes[1].plot(st, l, color="darkorange", lw=0.8, alpha=0.8)
+    axes[1].set_ylabel("Długość epizodu")
+    axes[1].set_xlabel("Kroki środowiska")
+    axes[1].set_title("Wykres długości epizodu")
+    axes[1].grid(alpha=0.3)
+
     plt.tight_layout()
-
     plt.savefig(save_path, dpi=150)
     plt.show()
 
-    print(f"Wykres zapisany → {save_path}")
 
+def print_results_table(results_list, eval_dict=None):
+    col0, cw = 38, 12
+    header = f"{'Konfiguracja':<{col0}}{'Ret(50)':>{cw}}{'SR(50)%':>{cw}}{'MaxRet':>{cw}}{'1st sukces':>{cw}}"
+    if eval_dict:
+        header += f"{'Śr.ret (val)':>{cw+2}}{'Śr.dł (val)':>{cw+2}}"
 
-def print_comparison_table(metrics_list):
-    keys = ["mean_return_last50", "success_rate_last50", "steps_to_first_success",
-            "total_wall_time_s", "max_return"]
-    headers = ["Konfiguracja", "Ret(50)", "SR(50)", "1stSuccess", "Czas[s]", "MaxRet"]
+    print(f"\n{'='*100}")
+    print("  WYNIKI")
+    print(f"{'='*100}")
+    print(f"  {header}")
+    print(f"  {'-'*98}")
 
-    col_w = [35, 10, 8, 12, 10, 10]
-    header_line = "  ".join(f"{h:<{w}}" for h, w in zip(headers, col_w))
-    print(f"\n{'='*90}")
-    print(f"  TABELA PORÓWNAWCZA")
-    print(f"{'='*90}")
-    print(f"  {header_line}")
-    print(f"  {'-'*88}")
-
-    for m in metrics_list:
-        s = m.summary()
-        vals = [
-            m.label[:col_w[0]],
-            f"{s['mean_return_last50']:.2f}",
-            f"{s['success_rate_last50']*100:.1f}%",
-            str(s["steps_to_first_success"]),
-            f"{s['total_wall_time_s']:.0f}",
-            f"{s['max_return']:.2f}",
-        ]
-        print("  " + "  ".join(f"{v:<{w}}" for v, w in zip(vals, col_w)))
-    print(f"{'='*90}")
-
+    for res in results_list:
+        m = metrics(res)
+        row = f"  {res['label']:<{col0}}{m['Ret(50)']:>{cw}.2f}{m['SR(50)']:>{cw}.1f}{m['MaxRet']:>{cw}.2f}{str(m['1st sukces']):>{cw}}"
+        if eval_dict and res["label"] in eval_dict:
+            er, el = eval_dict[res["label"]]
+            row += f"{f'{er.mean():.2f}±{er.std():.2f}':>{cw+2}}{f'{el.mean():.1f}±{el.std():.1f}':>{cw+2}}"
+        print(row)
+    print(f"{'='*100}")
 
 def run_single():
-    m = train(
-        scenario=SCENARIO,
-        noise_std=NOISE_STD,
-        noise_type=NOISE_TYPE,
+    res = train(
+        label=f"PPO | {FILTER_TYPE} | σ_pos=0.02 σ_vel=0.002",
+        sigma_pos=0.02, sigma_vel=0.002,
         filter_type=FILTER_TYPE,
-        save_path=Path(f"ppo_{FILTER_TYPE}_{NOISE_TYPE}_s{SCENARIO}.pt"),
-        label=f"PPO | {FILTER_TYPE} | {NOISE_TYPE} | σ={NOISE_STD} | S{SCENARIO}"
+        save_path=Path(f"ppo_{FILTER_TYPE}.pt")
     )
-    plot_metrics_comparison([m], m.label, "single_run.png")
-    return [m]
+    er, el = evaluate(res)
+    print_results_table([res], {res["label"]: (er, el)})
+    plot_training(res, "plot_single.png")
 
 
 def run_noise_sweep():
-    noise_types = ["gaussian", "jednostajny", "laplacea", "impulsowy"]
-    metrics_list = []
-    for nt in noise_types:
-        m = train(
-            scenario=SCENARIO,
-            noise_std=NOISE_STD,
-            noise_type=nt,
-            filter_type=FILTER_TYPE,
-            save_path=Path(f"ppo_{FILTER_TYPE}_{nt}.pt"),
-            label=f"{nt}"
-        )
-        metrics_list.append(m)
-    plot_metrics_comparison(metrics_list, f"Porównanie typów szumu (filtr: {FILTER_TYPE})", "noise_sweep.png")
-    print_comparison_table(metrics_list)
-    return metrics_list
+    results = {}
+    evals = {}
+
+    for sp, sv in NOISE_CONFIGS:
+        for ft in ["brak", "KF", "EKF"]:
+            if sp == 0.0 and sv == 0.0 and ft != "brak":
+                continue
+            label = "Brak szumu" if sp == 0.0 else f"σ_pos={sp} σ_vel={sv} [{ft}]"
+            print(f"\n>>> {label}")
+            res = train(label=label, sigma_pos=sp, sigma_vel=sv, filter_type=ft,
+                        save_path=Path(f"ppo_sp{sp}_sv{sv}_{ft}.pt"))
+            results[(sp, sv, ft)] = res
+            er, el = evaluate(res)
+            evals[label] = (er, el)
+
+    print_results_table(list(results.values()), evals)
 
 
 def run_filter_sweep():
-    filter_types = ["brak", "KF", "EKF"]
-    metrics_list = []
-    for ft in filter_types:
-        m = train(
-            scenario=SCENARIO,
-            noise_std=NOISE_STD,
-            noise_type=NOISE_TYPE,
-            filter_type=ft,
-            save_path=Path(f"ppo_{ft}_{NOISE_TYPE}.pt"),
-            label=f"{ft}"
-        )
-        metrics_list.append(m)
-    plot_metrics_comparison(metrics_list, f"Brak filtra vs KF vs EKF (szum: {NOISE_TYPE} σ={NOISE_STD})", "filter_sweep.png")
-    print_comparison_table(metrics_list)
-    return metrics_list
+    results = []
+    evals = {}
 
+    for ft in ["brak", "KF", "EKF"]:
+        label = f"σ_pos=0.04 σ_vel=0.004 [{ft}]"
+        print(f"\n>>> {label}")
+        res = train(label=label, sigma_pos=0.04, sigma_vel=0.004, filter_type=ft,
+                    save_path=Path(f"ppo_{ft}.pt"))
+        results.append(res)
+        er, el = evaluate(res)
+        evals[label] = (er, el)
 
-
+    print_results_table(results, evals)
 
 
 if __name__ == "__main__":
     runners = {
-        "single":       run_single,
-        "noise_sweep":  run_noise_sweep,
+        "single": run_single,
+        "noise_sweep": run_noise_sweep,
         "filter_sweep": run_filter_sweep,
     }
-    results = runners[RUN_MODE]()
+    runners[RUN_MODE]()
