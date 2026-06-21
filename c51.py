@@ -3,37 +3,40 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import tyro
 from torch.utils.tensorboard import SummaryWriter
-
 from buffers import ReplayBuffer
+from td3_baseline.td3_baseline import ExtendedKalmanFilterWrapper
 
+MAX_STEPS = 1000
+NOISE = np.array([0.08, 0.008])
+PROCESS_NOISE = np.array([1e-4, 1e-5])
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    exp_name: str = "c51"
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
+    cuda: bool = False
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "rl-mountain-car"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "tdomagala-agh"
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
+    save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
     upload_model: bool = False
     """whether to upload the saved model to huggingface"""
@@ -41,7 +44,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
+    env_id: str = "MountainCar-v0"
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
@@ -63,11 +66,11 @@ class Args:
     """the timesteps it takes to update the target network"""
     batch_size: int = 128
     """the batch size of sample from the reply memory"""
-    start_e: float = 1
+    start_e: float = 1.0
     """the starting epsilon for exploration"""
     end_e: float = 0.05
     """the ending epsilon for exploration"""
-    exploration_fraction: float = 0.5
+    exploration_fraction: float = 0.6
     """the fraction of `total-timesteps` it takes from start-e to go end-e"""
     learning_starts: int = 10000
     """timestep to start learning"""
@@ -75,14 +78,154 @@ class Args:
     """the frequency of training"""
 
 
+class HeightRewardWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.current_obs = None
+        self.continuous_episode_return = 0.0
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self.current_obs = obs
+        self.continuous_episode_return = 0.0
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        self.current_obs = obs
+
+        modified_reward = self.reward(reward)
+        continuous_reward = self.logging_reward(action)
+        self.continuous_episode_return += continuous_reward
+
+        if terminated or truncated:
+            if terminated:
+                self.continuous_episode_return += 100
+            info["custom_episode_return"] = self.continuous_episode_return
+
+        return obs, modified_reward, terminated, truncated, info
+
+    def reward(self, reward):
+        if self.current_obs is not None:
+            position = self.current_obs[0]
+            height = np.sin(3 * position)
+            reward += 0.5 * height
+
+        return reward
+
+    def logging_reward(self, action):
+        if self.current_obs is None:
+            return 0.0
+
+        return -0.1 * action**2
+
+class NoisyObservationWrapper(gym.ObservationWrapper):
+    def __init__(self, env: gym.Env, noise_std):
+        super().__init__(env)
+        self.noise_std = noise_std
+
+    def observation(self, obs: np.ndarray) -> np.ndarray:
+        return obs + np.random.normal(0.0, self.noise_std, size=obs.shape)
+
+
+class KalmanFilter:
+    _POWER = 0.0015
+
+    def __init__(self, obs_dim: int, obs_noise: np.ndarray, process_noise: np.ndarray):
+        n = obs_dim
+        # State transition
+        self.F = np.array([[1.0, 1.0],
+                           [0.0, 1.0]])
+        # Control-input matrix
+        self.B = np.array([[0.0],
+                           [self._POWER]])
+        self.H = np.eye(n)                      # observation model
+        self.Q = np.diag(process_noise)         # process noise covariance
+        self.R = np.diag(obs_noise ** 2)        # measurement noise covariance
+        self.x = np.zeros(n)                    # state estimate
+        self.P = np.eye(n)                      # error covariance
+
+    def reset(self, initial_obs: np.ndarray) -> None:
+        self.x = initial_obs.copy()
+        self.P = np.eye(len(initial_obs))
+
+    def update(self, z: np.ndarray, u: np.ndarray) -> np.ndarray:
+        # Predict state
+        u = np.atleast_1d(u).reshape(-1, 1)
+        x_pred = self.F @ self.x + (self.B @ u).squeeze()
+        P_pred = self.F @ self.P @ self.F.T + self.Q
+        # Update statte
+        S = self.H @ P_pred @ self.H.T + self.R
+        K = P_pred @ self.H.T @ np.linalg.inv(S)
+        self.x = x_pred + K @ (z - self.H @ x_pred)
+
+        I_KH = np.eye(len(self.x)) - K @ self.H
+        self.P = I_KH @ P_pred @ I_KH.T + K @ self.R @ K.T
+        return self.x.copy()
+
+
+class KalmanFilterWrapper(gym.Wrapper):
+    def __init__(self, env: gym.Env, obs_noise: np.ndarray, process_noise: np.ndarray):
+        super().__init__(env)
+        obs_dim = env.observation_space.shape[0]
+        self.kf = KalmanFilter(obs_dim, obs_noise, process_noise)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.kf.reset(obs)
+        return self.kf.update(obs, u=np.zeros(1)), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self.kf.update(obs, u=action), reward, terminated, truncated, info
+
+
+class MyStatisticsWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+        self.num_timestep = 0
+
+        self.last_50_success = deque(maxlen=50)
+        self.last_50_returns = deque(maxlen=50)
+        self.max_return = -np.inf
+        self.first_success = None
+    
+    def reset(self, *, seed = None, options = None):
+        print(f"Ret50: {np.mean(self.last_50_returns)}, SR50: {np.mean(self.last_50_success)}, MaxRet: {self.max_return}, FirstSuccess: {self.first_success if self.first_success is not None else -1}")
+
+        return super().reset(seed=seed, options=options)
+    
+    def step(self, action):
+        self.num_timestep += 1
+        obs, reward, terminated, truncated, info = super().step(action)
+
+        if terminated or truncated:
+            reward = info["custom_episode_return"]
+            self.last_50_returns.append(reward)
+            self.last_50_success.append(1.0 if terminated else 0)
+            if reward > self.max_return:
+                self.max_return = reward
+            if terminated and self.first_success is None:
+                self.first_success = self.num_timestep
+
+        return obs, reward, terminated, truncated, info
+
+
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make(env_id, render_mode="rgb_array", max_episode_steps=MAX_STEPS)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            env = gym.make(env_id, max_episode_steps=MAX_STEPS)
+        env = HeightRewardWrapper(env)
+        env = NoisyObservationWrapper(env, NOISE)
+        env = ExtendedKalmanFilterWrapper(env, NOISE, PROCESS_NOISE)
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = MyStatisticsWrapper(env)
+
         env.action_space.seed(seed)
 
         return env
@@ -122,7 +265,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 
 if __name__ == "__main__":
-    args = tyro.cli(Args)
+    args = Args()
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -189,9 +332,17 @@ if __name__ == "__main__":
         autoresets = np.logical_or(terminations, truncations)
         if autoresets[0]:
             if "episode" in infos.keys():
-                print(f"global_step={global_step}, episodic_return={infos['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", infos["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", infos["episode"]["l"], global_step)
+                episodic_return = infos["episode"]["r"][0]
+                episodic_length = infos["episode"]["l"][0]
+
+                print(f"global_step={global_step}, episodic_return={episodic_return}")
+                writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+
+                if "custom_episode_return" in infos:
+                    custom_episode_return = infos["custom_episode_return"][0]
+                    print(f"custom_episode_return={custom_episode_return}")
+                    writer.add_scalar("charts/custom_episode_return", custom_episode_return, global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer
         rb.add(obs, next_obs, actions, rewards, terminations, infos)
@@ -229,7 +380,7 @@ if __name__ == "__main__":
                     writer.add_scalar("losses/loss", loss.item(), global_step)
                     old_val = (old_pmfs * q_network.atoms).sum(1)
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
+                    # print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                 # optimize the model
@@ -255,7 +406,7 @@ if __name__ == "__main__":
             model_path,
             make_env,
             args.env_id,
-            eval_episodes=10,
+            eval_episodes=20,
             run_name=f"{run_name}-eval",
             Model=QNetwork,
             device=device,
@@ -263,13 +414,6 @@ if __name__ == "__main__":
         )
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "C51", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()
